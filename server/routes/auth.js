@@ -1,24 +1,29 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
 const { body, validationResult } = require('express-validator');
-const User = require('../models/User');
+const { User } = require('../models');
 const auth = require('../middleware/auth');
 
 const router = express.Router();
 
-// Generate JWT token
-const generateToken = (userId) => {
-  return jwt.sign({ userId }, process.env.JWT_SECRET, {
+// Generate JWT tokens
+const generateTokens = (userId) => {
+  const accessToken = jwt.sign({ userId }, process.env.JWT_SECRET, {
     expiresIn: process.env.JWT_EXPIRES_IN || '24h'
   });
+  
+  const refreshToken = jwt.sign({ userId }, process.env.JWT_REFRESH_SECRET, {
+    expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d'
+  });
+  
+  return { accessToken, refreshToken };
 };
 
 // @route   POST /api/auth/login
 // @desc    Login user
 // @access  Public
 router.post('/login', [
-  body('username').notEmpty().withMessage('Username is required'),
+  body('username').notEmpty().withMessage('Username or email is required'),
   body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
 ], async (req, res) => {
   try {
@@ -35,13 +40,20 @@ router.post('/login', [
 
     // Check for admin credentials first
     if (username === process.env.ADMIN_USERNAME && password === process.env.ADMIN_PASSWORD) {
-      const token = generateToken('admin');
+      const { accessToken, refreshToken } = generateTokens('admin');
       
-      res.cookie('token', token, {
+      res.cookie('token', accessToken, {
         httpOnly: true,
         secure: process.env.NODE_ENV === 'production',
         sameSite: 'strict',
         maxAge: 24 * 60 * 60 * 1000 // 24 hours
+      });
+
+      res.cookie('refreshToken', refreshToken, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'strict',
+        maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
       });
 
       return res.json({
@@ -50,15 +62,23 @@ router.post('/login', [
         user: {
           id: 'admin',
           username: 'admin',
-          role: 'admin'
+          email: process.env.ADMIN_EMAIL || 'admin@furnicraft.com',
+          role: 'admin',
+          firstName: 'Admin',
+          lastName: 'User'
         },
-        token
+        token: accessToken
       });
     }
 
     // Check database for user
     const user = await User.findOne({ 
-      $or: [{ username }, { email: username }] 
+      where: {
+        [require('sequelize').Op.or]: [
+          { username },
+          { email: username }
+        ]
+      }
     });
 
     if (!user) {
@@ -69,7 +89,7 @@ router.post('/login', [
     }
 
     // Check if account is locked
-    if (user.isLocked) {
+    if (user.isLocked()) {
       return res.status(423).json({
         success: false,
         message: 'Account temporarily locked due to too many failed login attempts'
@@ -94,37 +114,133 @@ router.post('/login', [
       });
     }
 
-    // Update last login
-    user.lastLogin = new Date();
-    user.loginAttempts = 0;
-    user.lockUntil = undefined;
-    await user.save();
+    // Update last login and reset attempts
+    await user.update({
+      lastLogin: new Date()
+    });
+    await user.resetLoginAttempts();
 
-    const token = generateToken(user._id);
+    const { accessToken, refreshToken } = generateTokens(user.id);
 
-    res.cookie('token', token, {
+    res.cookie('token', accessToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'strict',
       maxAge: 24 * 60 * 60 * 1000 // 24 hours
     });
 
+    res.cookie('refreshToken', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+    });
+
     res.json({
       success: true,
       message: 'Login successful',
       user: {
-        id: user._id,
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        avatar: user.avatar
+      },
+      token: accessToken
+    });
+
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error'
+    });
+  }
+});
+
+// @route   POST /api/auth/register
+// @desc    Register new user
+// @access  Public
+router.post('/register', [
+  body('username').isLength({ min: 3 }).withMessage('Username must be at least 3 characters'),
+  body('email').isEmail().withMessage('Please enter a valid email'),
+  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
+  body('firstName').optional().isLength({ min: 1 }).withMessage('First name cannot be empty'),
+  body('lastName').optional().isLength({ min: 1 }).withMessage('Last name cannot be empty')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const { username, email, password, firstName, lastName, phone } = req.body;
+
+    // Check if user already exists
+    const existingUser = await User.findOne({
+      where: {
+        [require('sequelize').Op.or]: [
+          { username },
+          { email }
+        ]
+      }
+    });
+
+    if (existingUser) {
+      return res.status(400).json({
+        success: false,
+        message: 'User already exists with this username or email'
+      });
+    }
+
+    // Create new user
+    const user = await User.create({
+      username,
+      email,
+      password,
+      firstName,
+      lastName,
+      phone
+    });
+
+    const { accessToken, refreshToken } = generateTokens(user.id);
+
+    res.cookie('token', accessToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 24 * 60 * 60 * 1000 // 24 hours
+    });
+
+    res.cookie('refreshToken', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'User registered successfully',
+      user: {
+        id: user.id,
         username: user.username,
         email: user.email,
         role: user.role,
         firstName: user.firstName,
         lastName: user.lastName
       },
-      token
+      token: accessToken
     });
 
   } catch (error) {
-    console.error('Login error:', error);
+    console.error('Registration error:', error);
     res.status(500).json({
       success: false,
       message: 'Server error'
@@ -137,6 +253,7 @@ router.post('/login', [
 // @access  Private
 router.post('/logout', (req, res) => {
   res.clearCookie('token');
+  res.clearCookie('refreshToken');
   res.json({
     success: true,
     message: 'Logged out successfully'
@@ -154,12 +271,18 @@ router.get('/me', auth, async (req, res) => {
         user: {
           id: 'admin',
           username: 'admin',
-          role: 'admin'
+          email: process.env.ADMIN_EMAIL || 'admin@furnicraft.com',
+          role: 'admin',
+          firstName: 'Admin',
+          lastName: 'User'
         }
       });
     }
 
-    const user = await User.findById(req.user.userId).select('-password');
+    const user = await User.findByPk(req.user.userId, {
+      attributes: { exclude: ['password', 'loginAttempts', 'lockUntil'] }
+    });
+
     if (!user) {
       return res.status(404).json({
         success: false,
@@ -170,12 +293,15 @@ router.get('/me', auth, async (req, res) => {
     res.json({
       success: true,
       user: {
-        id: user._id,
+        id: user.id,
         username: user.username,
         email: user.email,
         role: user.role,
         firstName: user.firstName,
-        lastName: user.lastName
+        lastName: user.lastName,
+        avatar: user.avatar,
+        preferences: user.preferences,
+        lastLogin: user.lastLogin
       }
     });
 
@@ -188,76 +314,48 @@ router.get('/me', auth, async (req, res) => {
   }
 });
 
-// @route   POST /api/auth/register
-// @desc    Register new user
+// @route   POST /api/auth/refresh
+// @desc    Refresh access token
 // @access  Public
-router.post('/register', [
-  body('username').isLength({ min: 3 }).withMessage('Username must be at least 3 characters'),
-  body('email').isEmail().withMessage('Please enter a valid email'),
-  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
-], async (req, res) => {
+router.post('/refresh', async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
+    const refreshToken = req.cookies.refreshToken;
+    
+    if (!refreshToken) {
+      return res.status(401).json({
         success: false,
-        message: 'Validation failed',
-        errors: errors.array()
+        message: 'Refresh token not provided'
       });
     }
 
-    const { username, email, password, firstName, lastName, phone } = req.body;
+    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+    const { accessToken, refreshToken: newRefreshToken } = generateTokens(decoded.userId);
 
-    // Check if user already exists
-    const existingUser = await User.findOne({
-      $or: [{ username }, { email }]
-    });
-
-    if (existingUser) {
-      return res.status(400).json({
-        success: false,
-        message: 'User already exists with this username or email'
-      });
-    }
-
-    // Create new user
-    const user = new User({
-      username,
-      email,
-      password,
-      firstName,
-      lastName,
-      phone
-    });
-
-    await user.save();
-
-    const token = generateToken(user._id);
-
-    res.cookie('token', token, {
+    res.cookie('token', accessToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'strict',
       maxAge: 24 * 60 * 60 * 1000 // 24 hours
     });
 
-    res.status(201).json({
+    res.cookie('refreshToken', newRefreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+    });
+
+    res.json({
       success: true,
-      message: 'User registered successfully',
-      user: {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        role: user.role
-      },
-      token
+      message: 'Token refreshed successfully',
+      token: accessToken
     });
 
   } catch (error) {
-    console.error('Registration error:', error);
-    res.status(500).json({
+    console.error('Token refresh error:', error);
+    res.status(401).json({
       success: false,
-      message: 'Server error'
+      message: 'Invalid refresh token'
     });
   }
 });

@@ -1,8 +1,9 @@
 const express = require('express');
 const { body, validationResult, query } = require('express-validator');
-const Product = require('../models/Product');
+const { Product, Category, Tag, Review, User } = require('../models');
 const auth = require('../middleware/auth');
 const adminAuth = require('../middleware/adminAuth');
+const { Op } = require('sequelize');
 
 const router = express.Router();
 
@@ -17,7 +18,10 @@ router.get('/', [
   query('minPrice').optional().isFloat({ min: 0 }),
   query('maxPrice').optional().isFloat({ min: 0 }),
   query('inStock').optional().isBoolean(),
-  query('search').optional().isString()
+  query('featured').optional().isBoolean(),
+  query('search').optional().isString(),
+  query('sortBy').optional().isIn(['name', 'price', 'rating', 'createdAt', 'views']),
+  query('sortOrder').optional().isIn(['asc', 'desc'])
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -37,53 +41,76 @@ router.get('/', [
       minPrice,
       maxPrice,
       inStock,
+      featured,
       search,
       sortBy = 'createdAt',
       sortOrder = 'desc'
     } = req.query;
 
-    // Build filter object
-    const filter = { isActive: true };
+    // Build where clause
+    const where = { status: 'active' };
 
     if (category && category !== 'All') {
-      filter.category = category;
+      const categoryRecord = await Category.findOne({ where: { name: category } });
+      if (categoryRecord) {
+        where.categoryId = categoryRecord.id;
+      }
     }
 
     if (material && material !== 'All') {
-      filter.material = material;
+      where.material = { [Op.iLike]: `%${material}%` };
     }
 
     if (minPrice || maxPrice) {
-      filter.price = {};
-      if (minPrice) filter.price.$gte = parseFloat(minPrice);
-      if (maxPrice) filter.price.$lte = parseFloat(maxPrice);
+      where.price = {};
+      if (minPrice) where.price[Op.gte] = parseFloat(minPrice);
+      if (maxPrice) where.price[Op.lte] = parseFloat(maxPrice);
     }
 
     if (inStock !== undefined) {
-      filter.inStock = inStock === 'true';
+      where.inStock = inStock === 'true';
+    }
+
+    if (featured !== undefined) {
+      where.featured = featured === 'true';
     }
 
     if (search) {
-      filter.$text = { $search: search };
+      where[Op.or] = [
+        { name: { [Op.iLike]: `%${search}%` } },
+        { description: { [Op.iLike]: `%${search}%` } },
+        { material: { [Op.iLike]: `%${search}%` } }
+      ];
     }
 
-    // Build sort object
-    const sort = {};
-    sort[sortBy] = sortOrder === 'asc' ? 1 : -1;
+    // Build order clause
+    const order = [[sortBy, sortOrder.toUpperCase()]];
 
     // Execute query with pagination
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const offset = (parseInt(page) - 1) * parseInt(limit);
     
-    const [products, total] = await Promise.all([
-      Product.find(filter)
-        .sort(sort)
-        .skip(skip)
-        .limit(parseInt(limit))
-        .select('-reviews'),
-      Product.countDocuments(filter)
-    ]);
+    const { count, rows: products } = await Product.findAndCountAll({
+      where,
+      include: [
+        {
+          model: Category,
+          as: 'category',
+          attributes: ['id', 'name', 'slug']
+        },
+        {
+          model: Tag,
+          as: 'tags',
+          attributes: ['id', 'name', 'slug', 'color'],
+          through: { attributes: [] }
+        }
+      ],
+      order,
+      offset,
+      limit: parseInt(limit),
+      distinct: true
+    });
 
-    const totalPages = Math.ceil(total / parseInt(limit));
+    const totalPages = Math.ceil(count / parseInt(limit));
 
     res.json({
       success: true,
@@ -91,7 +118,7 @@ router.get('/', [
       pagination: {
         currentPage: parseInt(page),
         totalPages,
-        totalItems: total,
+        totalItems: count,
         itemsPerPage: parseInt(limit),
         hasNextPage: parseInt(page) < totalPages,
         hasPrevPage: parseInt(page) > 1
@@ -112,9 +139,39 @@ router.get('/', [
 // @access  Public
 router.get('/:id', async (req, res) => {
   try {
-    const product = await Product.findOne({ 
-      _id: req.params.id, 
-      isActive: true 
+    const product = await Product.findOne({
+      where: { 
+        id: req.params.id, 
+        status: 'active' 
+      },
+      include: [
+        {
+          model: Category,
+          as: 'category',
+          attributes: ['id', 'name', 'slug']
+        },
+        {
+          model: Tag,
+          as: 'tags',
+          attributes: ['id', 'name', 'slug', 'color'],
+          through: { attributes: [] }
+        },
+        {
+          model: Review,
+          as: 'reviews',
+          where: { status: 'approved' },
+          required: false,
+          include: [
+            {
+              model: User,
+              as: 'user',
+              attributes: ['id', 'firstName', 'lastName', 'avatar']
+            }
+          ],
+          order: [['createdAt', 'DESC']],
+          limit: 10
+        }
+      ]
     });
 
     if (!product) {
@@ -124,6 +181,9 @@ router.get('/:id', async (req, res) => {
       });
     }
 
+    // Increment views
+    await product.incrementViews();
+
     res.json({
       success: true,
       data: product
@@ -131,12 +191,6 @@ router.get('/:id', async (req, res) => {
 
   } catch (error) {
     console.error('Get product error:', error);
-    if (error.name === 'CastError') {
-      return res.status(404).json({
-        success: false,
-        message: 'Product not found'
-      });
-    }
     res.status(500).json({
       success: false,
       message: 'Server error'
@@ -152,7 +206,7 @@ router.post('/', [auth, adminAuth], [
   body('description').notEmpty().withMessage('Description is required'),
   body('price').isFloat({ min: 0 }).withMessage('Price must be a positive number'),
   body('image').isURL().withMessage('Image must be a valid URL'),
-  body('category').isIn(['Living Room', 'Dining Room', 'Bedroom', 'Office', 'Kitchen', 'Outdoor', 'Storage', 'Lighting']).withMessage('Invalid category'),
+  body('categoryId').isUUID().withMessage('Valid category ID is required'),
   body('material').notEmpty().withMessage('Material is required')
 ], async (req, res) => {
   try {
@@ -165,13 +219,36 @@ router.post('/', [auth, adminAuth], [
       });
     }
 
-    const product = new Product(req.body);
-    await product.save();
+    // Verify category exists
+    const category = await Category.findByPk(req.body.categoryId);
+    if (!category) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid category ID'
+      });
+    }
+
+    const product = await Product.create(req.body);
+
+    // Handle tags if provided
+    if (req.body.tags && Array.isArray(req.body.tags)) {
+      const tags = await Tag.findAll({
+        where: { id: { [Op.in]: req.body.tags } }
+      });
+      await product.setTags(tags);
+    }
+
+    const createdProduct = await Product.findByPk(product.id, {
+      include: [
+        { model: Category, as: 'category' },
+        { model: Tag, as: 'tags', through: { attributes: [] } }
+      ]
+    });
 
     res.status(201).json({
       success: true,
       message: 'Product created successfully',
-      data: product
+      data: createdProduct
     });
 
   } catch (error) {
@@ -191,7 +268,7 @@ router.put('/:id', [auth, adminAuth], [
   body('description').optional().notEmpty().withMessage('Description cannot be empty'),
   body('price').optional().isFloat({ min: 0 }).withMessage('Price must be a positive number'),
   body('image').optional().isURL().withMessage('Image must be a valid URL'),
-  body('category').optional().isIn(['Living Room', 'Dining Room', 'Bedroom', 'Office', 'Kitchen', 'Outdoor', 'Storage', 'Lighting']).withMessage('Invalid category'),
+  body('categoryId').optional().isUUID().withMessage('Valid category ID is required'),
   body('material').optional().notEmpty().withMessage('Material cannot be empty')
 ], async (req, res) => {
   try {
@@ -204,12 +281,7 @@ router.put('/:id', [auth, adminAuth], [
       });
     }
 
-    const product = await Product.findByIdAndUpdate(
-      req.params.id,
-      { ...req.body, updatedAt: Date.now() },
-      { new: true, runValidators: true }
-    );
-
+    const product = await Product.findByPk(req.params.id);
     if (!product) {
       return res.status(404).json({
         success: false,
@@ -217,20 +289,42 @@ router.put('/:id', [auth, adminAuth], [
       });
     }
 
+    // Verify category exists if provided
+    if (req.body.categoryId) {
+      const category = await Category.findByPk(req.body.categoryId);
+      if (!category) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid category ID'
+        });
+      }
+    }
+
+    await product.update(req.body);
+
+    // Handle tags if provided
+    if (req.body.tags && Array.isArray(req.body.tags)) {
+      const tags = await Tag.findAll({
+        where: { id: { [Op.in]: req.body.tags } }
+      });
+      await product.setTags(tags);
+    }
+
+    const updatedProduct = await Product.findByPk(product.id, {
+      include: [
+        { model: Category, as: 'category' },
+        { model: Tag, as: 'tags', through: { attributes: [] } }
+      ]
+    });
+
     res.json({
       success: true,
       message: 'Product updated successfully',
-      data: product
+      data: updatedProduct
     });
 
   } catch (error) {
     console.error('Update product error:', error);
-    if (error.name === 'CastError') {
-      return res.status(404).json({
-        success: false,
-        message: 'Product not found'
-      });
-    }
     res.status(500).json({
       success: false,
       message: 'Server error'
@@ -243,18 +337,15 @@ router.put('/:id', [auth, adminAuth], [
 // @access  Private (Admin only)
 router.delete('/:id', [auth, adminAuth], async (req, res) => {
   try {
-    const product = await Product.findByIdAndUpdate(
-      req.params.id,
-      { isActive: false },
-      { new: true }
-    );
-
+    const product = await Product.findByPk(req.params.id);
     if (!product) {
       return res.status(404).json({
         success: false,
         message: 'Product not found'
       });
     }
+
+    await product.update({ status: 'archived' });
 
     res.json({
       success: true,
@@ -263,70 +354,6 @@ router.delete('/:id', [auth, adminAuth], async (req, res) => {
 
   } catch (error) {
     console.error('Delete product error:', error);
-    if (error.name === 'CastError') {
-      return res.status(404).json({
-        success: false,
-        message: 'Product not found'
-      });
-    }
-    res.status(500).json({
-      success: false,
-      message: 'Server error'
-    });
-  }
-});
-
-// @route   POST /api/products/:id/reviews
-// @desc    Add product review
-// @access  Public
-router.post('/:id/reviews', [
-  body('rating').isInt({ min: 1, max: 5 }).withMessage('Rating must be between 1 and 5'),
-  body('comment').notEmpty().withMessage('Comment is required'),
-  body('user').notEmpty().withMessage('User name is required')
-], async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Validation failed',
-        errors: errors.array()
-      });
-    }
-
-    const product = await Product.findById(req.params.id);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        message: 'Product not found'
-      });
-    }
-
-    const { rating, comment, user } = req.body;
-
-    // Add review
-    product.reviews.push({
-      user,
-      rating,
-      comment,
-      date: new Date()
-    });
-
-    // Update rating average
-    const totalRating = product.reviews.reduce((sum, review) => sum + review.rating, 0);
-    product.rating.average = totalRating / product.reviews.length;
-    product.rating.count = product.reviews.length;
-
-    await product.save();
-
-    res.status(201).json({
-      success: true,
-      message: 'Review added successfully',
-      data: product.reviews[product.reviews.length - 1]
-    });
-
-  } catch (error) {
-    console.error('Add review error:', error);
     res.status(500).json({
       success: false,
       message: 'Server error'

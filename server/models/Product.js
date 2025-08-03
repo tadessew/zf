@@ -1,101 +1,180 @@
-const mongoose = require('mongoose');
-
-const productSchema = new mongoose.Schema({
-  name: {
-    type: String,
-    required: [true, 'Product name is required'],
-    trim: true,
-    maxlength: [100, 'Product name cannot exceed 100 characters']
-  },
-  description: {
-    type: String,
-    required: [true, 'Product description is required'],
-    maxlength: [1000, 'Description cannot exceed 1000 characters']
-  },
-  price: {
-    type: Number,
-    required: [true, 'Product price is required'],
-    min: [0, 'Price cannot be negative']
-  },
-  image: {
-    type: String,
-    required: [true, 'Product image is required']
-  },
-  images: [{
-    type: String
-  }],
-  category: {
-    type: String,
-    required: [true, 'Product category is required'],
-    enum: ['Living Room', 'Dining Room', 'Bedroom', 'Office', 'Kitchen', 'Outdoor', 'Storage', 'Lighting']
-  },
-  material: {
-    type: String,
-    required: [true, 'Product material is required']
-  },
-  inStock: {
-    type: Boolean,
-    default: true
-  },
-  stockQuantity: {
-    type: Number,
-    default: 0,
-    min: [0, 'Stock quantity cannot be negative']
-  },
-  dimensions: {
-    length: Number,
-    width: Number,
-    height: Number,
-    unit: {
-      type: String,
-      default: 'cm'
-    }
-  },
-  weight: {
-    value: Number,
-    unit: {
-      type: String,
-      default: 'kg'
-    }
-  },
-  features: [String],
-  tags: [String],
-  rating: {
-    average: {
-      type: Number,
-      default: 0,
-      min: 0,
-      max: 5
+module.exports = (sequelize, DataTypes) => {
+  const Product = sequelize.define('Product', {
+    id: {
+      type: DataTypes.UUID,
+      defaultValue: DataTypes.UUIDV4,
+      primaryKey: true
     },
-    count: {
-      type: Number,
-      default: 0
-    }
-  },
-  reviews: [{
-    user: String,
+    name: {
+      type: DataTypes.STRING(200),
+      allowNull: false,
+      validate: {
+        notEmpty: true,
+        len: [1, 200]
+      }
+    },
+    description: {
+      type: DataTypes.TEXT,
+      allowNull: false,
+      validate: {
+        notEmpty: true
+      }
+    },
+    price: {
+      type: DataTypes.DECIMAL(10, 2),
+      allowNull: false,
+      validate: {
+        min: 0
+      }
+    },
+    comparePrice: {
+      type: DataTypes.DECIMAL(10, 2),
+      allowNull: true,
+      validate: {
+        min: 0
+      }
+    },
+    image: {
+      type: DataTypes.TEXT,
+      allowNull: false,
+      validate: {
+        isUrl: true
+      }
+    },
+    images: {
+      type: DataTypes.JSONB,
+      defaultValue: []
+    },
+    categoryId: {
+      type: DataTypes.UUID,
+      allowNull: false,
+      references: {
+        model: 'categories',
+        key: 'id'
+      }
+    },
+    material: {
+      type: DataTypes.STRING(100),
+      allowNull: false
+    },
+    inStock: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: true
+    },
+    stockQuantity: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+      validate: {
+        min: 0
+      }
+    },
+    dimensions: {
+      type: DataTypes.JSONB,
+      defaultValue: {
+        length: null,
+        width: null,
+        height: null,
+        unit: 'cm'
+      }
+    },
+    weight: {
+      type: DataTypes.JSONB,
+      defaultValue: {
+        value: null,
+        unit: 'kg'
+      }
+    },
+    features: {
+      type: DataTypes.JSONB,
+      defaultValue: []
+    },
+    specifications: {
+      type: DataTypes.JSONB,
+      defaultValue: {}
+    },
     rating: {
-      type: Number,
-      min: 1,
-      max: 5
+      type: DataTypes.DECIMAL(3, 2),
+      defaultValue: 0,
+      validate: {
+        min: 0,
+        max: 5
+      }
     },
-    comment: String,
-    date: {
-      type: Date,
-      default: Date.now
+    reviewCount: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+      validate: {
+        min: 0
+      }
+    },
+    views: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+      validate: {
+        min: 0
+      }
+    },
+    featured: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false
+    },
+    status: {
+      type: DataTypes.ENUM('active', 'inactive', 'draft', 'archived'),
+      defaultValue: 'active'
+    },
+    seo: {
+      type: DataTypes.JSONB,
+      defaultValue: {
+        metaTitle: null,
+        metaDescription: null,
+        keywords: []
+      }
+    },
+    customizable: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false
+    },
+    leadTime: {
+      type: DataTypes.STRING(50),
+      allowNull: true
     }
-  }],
-  isActive: {
-    type: Boolean,
-    default: true
-  }
-}, {
-  timestamps: true
-});
+  }, {
+    tableName: 'products',
+    timestamps: true,
+    indexes: [
+      { fields: ['name'] },
+      { fields: ['categoryId'] },
+      { fields: ['price'] },
+      { fields: ['inStock'] },
+      { fields: ['featured'] },
+      { fields: ['status'] },
+      { fields: ['rating'] },
+      {
+        name: 'products_search_idx',
+        fields: ['name', 'description'],
+        using: 'gin',
+        operator: 'gin_trgm_ops'
+      }
+    ]
+  });
 
-// Index for search functionality
-productSchema.index({ name: 'text', description: 'text', tags: 'text' });
-productSchema.index({ category: 1, inStock: 1 });
-productSchema.index({ price: 1 });
+  // Instance methods
+  Product.prototype.updateRating = async function() {
+    const reviews = await this.getReviews();
+    if (reviews.length > 0) {
+      const totalRating = reviews.reduce((sum, review) => sum + review.rating, 0);
+      const avgRating = totalRating / reviews.length;
+      
+      await this.update({
+        rating: avgRating,
+        reviewCount: reviews.length
+      });
+    }
+  };
 
-module.exports = mongoose.model('Product', productSchema);
+  Product.prototype.incrementViews = async function() {
+    await this.increment('views');
+  };
+
+  return Product;
+};
