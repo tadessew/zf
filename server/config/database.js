@@ -16,10 +16,30 @@ if (process.env.DATABASE_URL) {
       } : false
     },
     pool: {
-      max: 10,
+      max: 20,
       min: 0,
-      acquire: 30000,
+      acquire: 60000,
       idle: 10000
+    },
+    retry: {
+      match: [
+        /ETIMEDOUT/,
+        /EHOSTUNREACH/,
+        /ECONNRESET/,
+        /ECONNREFUSED/,
+        /ETIMEDOUT/,
+        /ESOCKETTIMEDOUT/,
+        /EHOSTUNREACH/,
+        /EPIPE/,
+        /EAI_AGAIN/,
+        /SequelizeConnectionError/,
+        /SequelizeConnectionRefusedError/,
+        /SequelizeHostNotFoundError/,
+        /SequelizeHostNotReachableError/,
+        /SequelizeInvalidConnectionError/,
+        /SequelizeConnectionTimedOutError/
+      ],
+      max: 3
     }
   });
 } else {
@@ -34,10 +54,30 @@ if (process.env.DATABASE_URL) {
       dialect: 'postgres',
       logging: process.env.NODE_ENV === 'development' ? console.log : false,
       pool: {
-        max: 10,
+        max: 20,
         min: 0,
-        acquire: 30000,
+        acquire: 60000,
         idle: 10000
+      },
+      retry: {
+        match: [
+          /ETIMEDOUT/,
+          /EHOSTUNREACH/,
+          /ECONNRESET/,
+          /ECONNREFUSED/,
+          /ETIMEDOUT/,
+          /ESOCKETTIMEDOUT/,
+          /EHOSTUNREACH/,
+          /EPIPE/,
+          /EAI_AGAIN/,
+          /SequelizeConnectionError/,
+          /SequelizeConnectionRefusedError/,
+          /SequelizeHostNotFoundError/,
+          /SequelizeHostNotReachableError/,
+          /SequelizeInvalidConnectionError/,
+          /SequelizeConnectionTimedOutError/
+        ],
+        max: 3
       }
     }
   );
@@ -56,20 +96,28 @@ const connectDB = async () => {
     
   } catch (error) {
     console.error('❌ Database connection failed:', error.message);
-    process.exit(1);
+    
+    // Retry connection after 5 seconds
+    setTimeout(() => {
+      console.log('🔄 Retrying database connection...');
+      connectDB();
+    }, 5000);
   }
 };
 
 // Graceful shutdown
-process.on('SIGINT', async () => {
+const gracefulShutdown = async () => {
   try {
     await sequelize.close();
-    console.log('📦 Database connection closed');
+    console.log('📦 Database connection closed gracefully');
     process.exit(0);
   } catch (error) {
     console.error('❌ Error closing database connection:', error);
     process.exit(1);
   }
-});
+};
+
+process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);
 
 module.exports = { sequelize, connectDB };

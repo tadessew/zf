@@ -191,6 +191,12 @@ router.get('/:id', async (req, res) => {
 
   } catch (error) {
     console.error('Get product error:', error);
+    if (error.name === 'CastError') {
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found'
+      });
+    }
     res.status(500).json({
       success: false,
       message: 'Server error'
@@ -207,7 +213,8 @@ router.post('/', [auth, adminAuth], [
   body('price').isFloat({ min: 0 }).withMessage('Price must be a positive number'),
   body('image').isURL().withMessage('Image must be a valid URL'),
   body('categoryId').isUUID().withMessage('Valid category ID is required'),
-  body('material').notEmpty().withMessage('Material is required')
+  body('material').notEmpty().withMessage('Material is required'),
+  body('stockQuantity').optional().isInt({ min: 0 }).withMessage('Stock quantity must be non-negative')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -325,6 +332,12 @@ router.put('/:id', [auth, adminAuth], [
 
   } catch (error) {
     console.error('Update product error:', error);
+    if (error.name === 'CastError') {
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found'
+      });
+    }
     res.status(500).json({
       success: false,
       message: 'Server error'
@@ -354,6 +367,52 @@ router.delete('/:id', [auth, adminAuth], async (req, res) => {
 
   } catch (error) {
     console.error('Delete product error:', error);
+    if (error.name === 'CastError') {
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found'
+      });
+    }
+    res.status(500).json({
+      success: false,
+      message: 'Server error'
+    });
+  }
+});
+
+// @route   GET /api/products/:id/related
+// @desc    Get related products
+// @access  Public
+router.get('/:id/related', async (req, res) => {
+  try {
+    const product = await Product.findByPk(req.params.id);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found'
+      });
+    }
+
+    const relatedProducts = await Product.findAll({
+      where: {
+        categoryId: product.categoryId,
+        id: { [Op.ne]: product.id },
+        status: 'active'
+      },
+      include: [
+        { model: Category, as: 'category', attributes: ['id', 'name'] }
+      ],
+      limit: 4,
+      order: [['rating', 'DESC'], ['views', 'DESC']]
+    });
+
+    res.json({
+      success: true,
+      data: relatedProducts
+    });
+
+  } catch (error) {
+    console.error('Get related products error:', error);
     res.status(500).json({
       success: false,
       message: 'Server error'
